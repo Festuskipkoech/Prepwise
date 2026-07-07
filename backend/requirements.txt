@@ -1,0 +1,40 @@
+# web framework
+fastapi 
+uvicorn[standard] 
+sse-starlette 
+python-multipart 
+
+#settings
+pydantic 
+pydantic-settings 
+
+# Database
+sqlalchemy[asyncio]
+asyncpg
+alembic
+
+# Auth
+python-jose[cryptography]
+passlib[bcrypt]
+
+# llm & agent
+langchain
+langchain-anthropic
+langchain-openai
+langchain-community
+langgraph
+anthropic
+
+# Vector DB
+qdrant-client
+
+# Embeddings
+httpx
+
+# Job Search
+google-search-results
+
+# Utilities
+python-dotenv
+tenacity
+structlog
