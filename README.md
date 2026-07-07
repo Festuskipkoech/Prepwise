@@ -75,7 +75,7 @@ time so you see output as it arrives rather than staring at a blank screen.
 
 For a full technical breakdown of the architecture, the data model, the agent design,
 the streaming pattern, and the engineering decisions behind the system, see
-[docs/architecture.md](docs/architecture.md).
+[backend/docs/architecture.md](backend/docs/architecture.md).
 
 ---
 
@@ -98,7 +98,7 @@ that tractable.
 Python, FastAPI, LangGraph, LangChain, Anthropic Claude, Jina Embeddings, Qdrant,
 PostgreSQL, Next.js, TailwindCSS.
 
-Full stack and dependency details are in [docs/architecture.md](docs/architecture.md).
+Full stack and dependency details are in [backend/docs/architecture.md](backend/docs/architecture.md).
 
 ---
 
