@@ -5,7 +5,8 @@ sse-starlette
 python-multipart 
 
 #settings
-pydantic 
+pydantic
+pydantic[email]
 pydantic-settings 
 
 # Database
@@ -13,9 +14,12 @@ sqlalchemy[asyncio]
 asyncpg
 alembic
 
+# redis
+redis
+
 # Auth
-python-jose[cryptography]
-passlib[bcrypt]
+bcrypt
+PyJWT
 
 # llm & agent
 langchain

@@ -1,5 +1,5 @@
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.collections import Distance, VectorParams
+from qdrant_client.models import Distance, VectorParams
 
 from app.core.config import settings
 
@@ -19,17 +19,17 @@ async def setup_collections(client: AsyncQdrantClient) -> None:
 
     if PROFILE_COLLECTION not in existing_names:
         await client.create_collection(
-            collection_name = PROFILE_COLLECTION,
-            vectors_config = VectorParams(
+            collection_name=PROFILE_COLLECTION,
+            vectors_config=VectorParams(
                 size=VECTOR_SIZE,
-                distance = Distance.cosine
+                distance=Distance.COSINE 
             ),
         )
     if PREP_COLLECTION not in existing_names:
         await client.create_collection(
-            collection_name = PREP_COLLECTION,
-            vectors_config = VectorParams(
-                size = VECTOR_SIZE,
-                distance=Distance.cosine
+            collection_name=PREP_COLLECTION,
+            vectors_config=VectorParams(
+                size=VECTOR_SIZE,
+                distance=Distance.COSINE
             )
         )

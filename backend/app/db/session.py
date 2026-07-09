@@ -3,7 +3,6 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 
-
 engine = create_async_engine(
     settings.database_url,
     echo=settings.app_env == "development",
@@ -19,7 +18,6 @@ AsyncSessionFactory = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
-
 
 class Base(DeclarativeBase):
     pass

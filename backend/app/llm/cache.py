@@ -34,7 +34,7 @@ class CacheKeepalive:
 
     async def _ping(self) -> None:
         await self._client.messages.create(
-            model = settings.llm_haiku_model,
+            model = settings.llm_small_model,
             max_tokens=1,
             system=build_cached_system_message(self.profile_text),
             messages=[{"role": "user", "content": "ping"}]

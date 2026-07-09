@@ -1,6 +1,6 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -10,10 +10,10 @@ class Settings(BaseSettings):
     )
 
     # Application
-    app_env: str 
-    app_host: str  
-    app_port: int 
-    allowed_origins: list[str]
+    app_env: str
+    app_host: str
+    app_port: int
+    allowed_origins: str
 
     # Database
     postgres_user: str
@@ -21,15 +21,24 @@ class Settings(BaseSettings):
     postgres_db: str
     database_url: str
 
+    # Redis
+    redis_url: str
+    redis_password: str
+    redis_db_auth: int
+    redis_db_pubsub: int
+    redis_db_cache: int
+    redis_db_ratelimit: int
+
     # Qdrant
-    qdrant_host: str  
-    qdrant_port: int  
+    qdrant_host: str
+    qdrant_port: int
 
     # LLM
     anthropic_api_key: str
-    openai_api_key:str
-    llm_sonnet_model: str  
-    llm_haiku_model: str  
+    openai_api_key: str
+    llm_large_model: str
+    llm_small_model: str
+
     # Embeddings
     jina_api_key: str
 
@@ -37,12 +46,12 @@ class Settings(BaseSettings):
     serp_api_key: str
 
     # Auth
-    jwt_secret_key: str
-    jwt_algorithm: str  
-    jwt_expiry_days: int  
-
-    # Profile
-    profile_path: str 
+    jwt_access_secret: str
+    jwt_refresh_secret: str
+    jwt_algorithm: str = "HS256"
+    jwt_access_expiry_minutes: int = 15
+    jwt_refresh_expiry_days: int = 30
+    bcrypt_cost: int = 12
 
     @property
     def is_production(self) -> bool:

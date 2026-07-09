@@ -1,86 +1,60 @@
-from typing import AsyncGenerator
+import uuid
+import logging
+from typing import Annotated, AsyncGenerator
 
+import redis.asyncio as aioredis
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions.auth import InvalidTokenError
 from app.core.security import decode_access_token
 from app.db.models.users import User
 from app.db.session import AsyncSessionFactory
-from app.core.exceptions.auth import InvalidTokenError
-from app.repositories.user_repository import UserRepository
-from app.services.document_service import DocumentService
-from app.services.job_service import JobService
-from app.services.profile_service import ProfileService
-from app.services.prep_service import PrepService
-from app.services.tracker_service import TrackerService
+from app.repositories.auth_repository import UserRepository
+from app.repositories.session_repository import SessionRepository
 
-bearer_scheme = HTTPBearer()
+logger = logging.getLogger(__name__)
+bearer_scheme = HTTPBearer(auto_error=False)
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionFactory() as session:
         yield session
 
-def get_llm_client(request: Request):
-    return request.app.state.llm_client
-
-def get_qdrant(request: Request):
-    return request.app.state.qdrant_client
-
+async def get_redis_auth(request: Request) -> aioredis.Redis:
+    return request.app.state.redis_auth
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
+    credentials: Annotated[
+        HTTPAuthorizationCredentials, Depends(bearer_scheme)
+    ],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis_auth: Annotated[aioredis.Redis, Depends(get_redis_auth)],
 ) -> User:
-    token = credentials.credentials
-    email = decode_access_token(token)
+    if not credentials:
+        raise InvalidTokenError()
+
+    decoded = decode_access_token(credentials.credentials)
+    jti = decoded["jti"]
+    user_id_str = decoded["user_id"]
+
+    session_repo = SessionRepository(db, redis_auth)
+    cached_user_id = await session_repo.get_cached_access_token(jti)
+
+    if cached_user_id:
+        if cached_user_id != user_id_str:
+            raise InvalidTokenError()
+    else:
+        session = await session_repo.get_by_jti(jti)
+        if not session:
+            raise InvalidTokenError()
+        await session_repo.cache_access_token(jti, str(session.user_id))
 
     user_repo = UserRepository(db)
-    user = await user_repo.get_by_email(email)
+    user = await user_repo.get_by_id(uuid.UUID(user_id_str))
 
-    if user is None:
+    if not user or not user.is_active:
         raise InvalidTokenError()
 
     return user
 
-def get_profile_service(request: Request) -> ProfileService:
-    return ProfileService(
-        llm=request.app.state.llm_client,
-        qdrant=request.app.state.qdrant_client,
-    )
-
-def get_job_service(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-) -> JobService:
-    return JobService(
-        db=db,
-        llm=request.app.state.llm_client,
-    )
-
-def get_document_service(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-) -> DocumentService:
-    return DocumentService(
-        db=db,
-        llm=request.app.state.llm_client,
-        qdrant=request.app.state.qdrant_client,
-    )
-
-def get_prep_service(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-) -> PrepService:
-    return PrepService(
-        db=db,
-        llm=request.app.state.llm_client,
-    )
-
-def get_tracker_service(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-) -> TrackerService:
-    return TrackerService(
-        db=db,
-        llm=request.app.state.llm_client,
-    )
+CurrentUser = Annotated[User, Depends(get_current_user)]

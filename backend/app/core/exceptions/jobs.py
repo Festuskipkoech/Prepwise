@@ -1,4 +1,4 @@
-from app.exceptions.base import AppException
+from app.core.exceptions.base import AppException
 
 class JobNotFoundError(AppException):
     def __init__(self, message: str = "Job not found") -> None:

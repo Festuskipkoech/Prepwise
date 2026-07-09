@@ -36,7 +36,7 @@ HAIKU_TASKS = {
 
 def resolve_model(task: LLMTask) -> str:
     if task in SONNET_TASKS:
-        return settings.llm_sonnet_model
+        return settings.llm_large_model
     if task in HAIKU_TASKS:
-        return settings.llm_haiku_model
-    return settings.llm_sonnet_model
+        return settings.llm_small_model
+    return settings.llm_large_model
