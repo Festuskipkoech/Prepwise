@@ -1,144 +1,147 @@
+import logging
 import re
-import uuid
 from dataclasses import dataclass, field
-from typing import Any
-
+from typing import Literal
+ 
+logger = logging.getLogger(__name__)
+ 
+ChunkType = Literal["identity", "skill", "project", "experience", "achievement", "certification"] 
+ 
 @dataclass
-class Chunk:
-    id: str
+class ProfileChunk:
+    user_id: str
+    type: ChunkType
+    name: str
     text: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+    stack_tags: list[str] = field(default_factory=list)
+    depth_level: int | None = None
+    period: str | None = None
 
-def _new_id() -> str:
-    return str(uuid.uuid4())
+def _extract_stack_tags(block: str) -> list[str]:
+    match = re.search(r"Stack:\s*(.+)", block, re.IGNORECASE)
+    if not match:
+        return []
+    raw = match.group(1)
+    return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
-def _extract_section(markdown: str, heading: str) -> str:
-    pattern = rf"##\s+{re.escape(heading)}\n(.*?)(?=\n##\s|\Z)"
-    match = re.search(pattern, markdown, re.DOTALL)
-    return match.group(1).strip() if match else ""
+def _extract_depth(block: str) -> int | None:
+    match = re.search(r"Depth:\s*(\d)", block, re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1)) 
+ 
+def _extract_period(block: str) -> str | None:
+    match = re.search(r"Period:\s*(.+)", block, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip()
 
-def chunk_profile(profile_text: str) -> list[Chunk]:
-    chunks: list[Chunk] = []
+def _split_h3_blocks(section: str) -> list[tuple[str, str]]:
+    """Split a markdown section into (heading_name, block_text) pairs on ### boundaries."""
+    pattern = re.compile(r"^###\s+(.+)$", re.MULTILINE)
 
-    projects_raw = _extract_section(profile_text, "Projects")
-    if projects_raw:
-        project_blocks = re.split(r"\n###\s+", projects_raw)
-        for block in project_blocks:
-            block = block.strip()
-            if not block:
-                continue
-            lines = block.splitlines()
-            name = lines[0].strip("# ").strip()
-            body = "\n".join(lines[1:]).strip()
+    headings =list(pattern.finditer(section))
+    if not headings:
+        return []
 
-            stack_match = re.search(r"Stack:\s*(.+)", body)
-            stack_tags = (
-                [t.strip() for t in stack_match.group(1).split(",")]
-                if stack_match
-                else []
+    blocks = []
+    for i, match in enumerate(headings):
+        name = match.group(1).strip()
+        start = match.end()
+        end = headings[i + 1].start() if i +1 < len(headings) else len(section)
+        body = section[start:end].strip()
+        blocks.append((name, f"### {name}\n{body}"))
+
+    return blocks
+
+def parse_profile_chunks(normalised_md: str, user_id: str) -> list[ProfileChunk]:
+    chunks: list[ProfileChunk] = []
+
+    section_pattern = re.compile(r"^##\s+(.+)$", re.MULTILINE)
+    section_matches = list(section_pattern.finditer(normalised_md))
+
+    sections: dict[str, str]  = {}
+    for i, match in enumerate(section_matches):
+        heading = match.group(1).strip().lower()
+        start = match.end()
+        end = section_matches[i + 1].start() if i + 1 < len(section_matches) else len(normalised_md)
+        sections[heading] = normalised_md[start:end].strip()
+
+    # Identity block — the entire ## Identity section is one chunk
+    if "identity" in sections:
+        chunks.append(
+            ProfileChunk(
+                user_id=user_id,
+                type="identity",
+                name="Identity",
+                text=f"## Identity\n{sections['identity']}",
             )
-
-            metrics_match = re.search(r"Metrics:\s*(.+)", body)
-            scale_metrics = metrics_match.group(1).strip() if metrics_match else ""
-
+        )
+ 
+    # Skills — one chunk per ### Skill block
+    if "skills" in sections:
+        for name, block in _split_h3_blocks(sections["skills"]):
             chunks.append(
-                Chunk(
-                    id=_new_id(),
-                    text=f"Project: {name}\n{body}",
-                    metadata={
-                        "type": "project",
-                        "project_name": name,
-                        "stack_tags": stack_tags,
-                        "scale_metrics": scale_metrics,
-                    },
+                ProfileChunk(
+                    user_id=user_id,
+                    type="skill",
+                    name=name,
+                    text=block,
+                    stack_tags=_extract_stack_tags(block),
+                    depth_level=_extract_depth(block),
                 )
             )
-
-    skills_raw = _extract_section(profile_text, "Skills")
-    if skills_raw:
-        skill_blocks = re.split(r"\n###\s+", skills_raw)
-        for block in skill_blocks:
-            block = block.strip()
-            if not block:
-                continue
-            lines = block.splitlines()
-            skill_name = lines[0].strip("# ").strip()
-            body = "\n".join(lines[1:]).strip()
-
-            depth_match = re.search(r"Depth:\s*(\d)", body)
-            depth_level = int(depth_match.group(1)) if depth_match else 0
-
+ 
+    # Projects — one chunk per ### Project block
+    if "projects" in sections:
+        for name, block in _split_h3_blocks(sections["projects"]):
             chunks.append(
-                Chunk(
-                    id=_new_id(),
-                    text=f"Skill: {skill_name}\n{body}",
-                    metadata={
-                        "type": "skill",
-                        "skill_name": skill_name,
-                        "depth_level": depth_level,
-                    },
+                ProfileChunk(
+                    user_id=user_id,
+                    type="project",
+                    name=name,
+                    text=block,
+                    stack_tags=_extract_stack_tags(block),
                 )
             )
-
-    experience_raw = _extract_section(profile_text, "Experience")
-    if experience_raw:
-        exp_blocks = re.split(r"\n###\s+", experience_raw)
-        for block in exp_blocks:
-            block = block.strip()
-            if not block:
-                continue
-            lines = block.splitlines()
-            role_name = lines[0].strip("# ").strip()
-            body = "\n".join(lines[1:]).strip()
-
-            company_match = re.search(r"Company:\s*(.+)", body)
-            period_match = re.search(r"Period:\s*(.+)", body)
-            stack_match = re.search(r"Stack:\s*(.+)", body)
-
+ 
+    # Experience — one chunk per ### Role block
+    if "experience" in sections:
+        for name, block in _split_h3_blocks(sections["experience"]):
             chunks.append(
-                Chunk(
-                    id=_new_id(),
-                    text=f"Experience: {role_name}\n{body}",
-                    metadata={
-                        "type": "experience",
-                        "role_name": role_name,
-                        "company": company_match.group(1).strip() if company_match else "",
-                        "period": period_match.group(1).strip() if period_match else "",
-                        "stack_tags": (
-                            [t.strip() for t in stack_match.group(1).split(",")]
-                            if stack_match
-                            else []
-                        ),
-                    },
+                ProfileChunk(
+                    user_id=user_id,
+                    type="experience",
+                    name=name,
+                    text=block,
+                    stack_tags=_extract_stack_tags(block),
+                    period=_extract_period(block),
                 )
             )
-
+ 
+    # Achievements — entire section as one chunk
+    if "achievements" in sections:
+        chunks.append(
+            ProfileChunk(
+                user_id=user_id,
+                type="achievement",
+                name="Achievements",
+                text=f"## Achievements\n{sections['achievements']}",
+            )
+        )
+ 
+    # Certifications — entire section as one chunk
+    if "certifications" in sections:
+        chunks.append(
+            ProfileChunk(
+                user_id=user_id,
+                type="certification",
+                name="Certifications",
+                text=f"## Certifications\n{sections['certifications']}",
+            )
+        )
+ 
+    logger.debug("Parsed %d chunks for user %s", len(chunks), user_id)
     return chunks
 
-def chunk_subtopic(
-    subtopic_id: str,
-    subject: str,
-    topic: str,
-    subtopic_name: str,
-    concept: str,
-    project_evidence: str,
-    skill_tags: list[str],
-) -> Chunk:
-    text = (
-        f"Subject: {subject}\n"
-        f"Topic: {topic}\n"
-        f"Subtopic: {subtopic_name}\n\n"
-        f"Concept:\n{concept}\n\n"
-        f"Project Evidence:\n{project_evidence}"
-    )
-    return Chunk(
-        id=subtopic_id,
-        text=text,
-        metadata={
-            "type": "subtopic",
-            "subject": subject,
-            "topic": topic,
-            "subtopic": subtopic_name,
-            "skill_tags": skill_tags,
-        },
-    )
+ 

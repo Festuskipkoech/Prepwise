@@ -63,9 +63,23 @@ It is designed to scale from a single user running it locally to a commercial pl
 
 ## The technology
 
-Prepwise is built on a modern, production-grade stack. The backend is a Python API powered by FastAPI, with intelligent agents built on LangGraph and Claude from Anthropic. Conversations stream in real time over WebSocket connections. All data is stored in PostgreSQL. Semantic search uses Jina embeddings and a Qdrant vector database. The frontend is built on Next.js.
+Prepwise is built on a modern, production-grade stack. The backend is a Python API powered by FastAPI, with intelligent agents built on LangGraph. Conversations stream in real time over WebSocket connections. All data is stored in PostgreSQL. Semantic search uses Jina embeddings and a Qdrant vector database. The frontend is built on Next.js.
 
-A full technical breakdown covering the architecture, the database design, the agent design for each engine, and the engineering decisions behind the system is available in the technical documentation.
+---
+
+## Technical Documentation
+
+Full technical documentation lives in the `/docs` directory. Each document covers one concern end to end — architecture, agent design, graph structure, state, tools, system prompts, database interactions, and streaming pattern.
+
+| Document | What it covers |
+|---|---|
+| [Authentication](backend/docs/auth.md) | Session management, dual-token strategy, Redis caching, WebSocket auth, multi-user security |
+| [Shared Infrastructure](backend/docs/shared-infrastructure.md) | WebSocket layer, Redis pub/sub, classification, LangGraph checkpointing, profile ingestion, vector store, model routing |
+| [Job Search Engine](backend/docs/job-engine.md) | Job search agent, tool definitions, conversation flow, result scoring, graph structure |
+| [Prep Engine](backend/docs/prep-engine.md) | Interview prep agent, roadmap generation, conversational drilling, quiz and feedback loop, graph structure |
+| [Document Engine](backend/docs/document-engine.md) | Resume and cover letter generation, iterative editing, version history, graph structure |
+| [Tracker Engine](backend/docs/tracker-engine.md) | Application tracking panel, conversational analysis agent, funnel analysis, graph structure |
+| [Database Design](backend/docs/database.md) | Full schema, indexes, Redis database allocation, Qdrant collections, query patterns per engine |
 
 ---
 

@@ -40,7 +40,19 @@ class Settings(BaseSettings):
     llm_small_model: str
 
     # Embeddings
+    embedding_model: str = "jina-embeddings-v4"
+    embedding_dimensions: int = 2048
     jina_api_key: str
+
+    # Conversation compression
+    compression_threshold_prep: int = 12000
+    compression_threshold_job: int = 8000
+    compression_threshold_document: int = 8000
+    compression_threshold_tracker: int = 8000
+    compression_tail_turns_prep: int = 6
+    compression_tail_turns_job: int = 4
+    compression_tail_turns_document: int = 4
+    compression_tail_turns_tracker: int = 4
 
     # Job Search
     serp_api_key: str
@@ -53,14 +65,25 @@ class Settings(BaseSettings):
     jwt_refresh_expiry_days: int = 30
     bcrypt_cost: int = 12
 
+    # Tests
+    test_resume_path: str
+    test_user_email: str
+    test_user_password: str
+    test_user_name: str
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
-
+    
+    @property
+    def langgraph_url(self) -> str:
+        return (
+            f"postgresql://{self.postgres_user}:{self.postgres_password}"
+            f"@localhost:5434/{self.postgres_db}"
+        )
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
 
 settings = get_settings()

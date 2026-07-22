@@ -99,22 +99,14 @@ class SessionRepository:
 
     # Redis operations
     async def cache_access_token(self, jti: str, user_id: str) -> None:
-        try:
-            await self._redis.setex(
-                f"access:{jti}",
-                settings.jwt_access_expiry_minutes * 60,
-                user_id,
-            )
+        try: 
+            await self._redis.set(f"access:{jti}", user_id, ex=settings.jwt_access_expiry_minutes * 60)
         except Exception:
             pass
 
     async def cache_refresh_token(self, token_hash: str, session_id: str) -> None:
         try:
-            await self._redis.setex(
-                f"refresh:{token_hash}",
-                settings.jwt_refresh_expiry_days * 86400,
-                session_id,
-            )
+            await self._redis.set(f"refresh:{token_hash}", session_id, ex=settings.jwt_refresh_expiry_days * 86400)
         except Exception:
             pass
 

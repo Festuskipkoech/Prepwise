@@ -4,6 +4,147 @@ This document covers everything that sits beneath and across all four engines: t
 
 ---
 
+## Coding Practices and Patterns
+
+These rules apply to every file in the codebase without exception. They are not preferences — they are constraints. Any new file must conform to all of them.
+
+### Async throughout
+
+Every function that touches a database, Redis, the filesystem, an HTTP client, or an LLM is async. No sync calls on the event loop. Background work that is too heavy for the request path goes to a task queue, not `asyncio.create_task`.
+
+### Singleton infrastructure
+
+All infrastructure clients — database engine, Redis pools, Qdrant client, LLM clients, embeddings, ConnectionManager, RedisPubSubManager, LangGraph checkpointer and store — are initialised once in the FastAPI lifespan context manager and stored on `app.state`. They are never instantiated per request.
+
+### Dependency injection
+
+Request handlers receive infrastructure via FastAPI `Depends()` providers. Providers pull from `request.app.state`. Repositories receive `db` and `redis` as constructor arguments. Nothing is imported as a global instance outside of `app.state`.
+
+```python
+def get_qdrant_client(request: Request) -> AsyncQdrantClient:
+    return request.app.state.qdrant_client
+```
+
+### ORM everywhere
+
+All database reads and writes use SQLAlchemy ORM style — `select()`, `db.add()`, `db.commit()`, `db.refresh()`. Raw SQL via `text()` is not used except in migrations. This applies to every layer including tools, indexers, and background tasks.
+
+### Repository pattern
+
+All database access goes through repository classes. Routes and agents never query the database directly. Repositories take `db: AsyncSession` and `redis: aioredis.Redis` as constructor arguments — never pulled from global state inside the repository.
+
+### Custom exceptions
+
+HTTP errors are raised as custom exception classes, never as raw `HTTPException`. Exception handlers are registered once in `main.py` via `register_exception_handlers(app)`.
+
+### No hardcoded constants
+
+Thresholds, model names, TTLs, limits, and any value that could change between environments live in `settings` via `config.py`. Environment variables use generic names — `LLM_LARGE_MODEL` not `ANTHROPIC_MODEL` — so the provider can be swapped at configuration time.
+
+---
+
+## File Naming and Directory Conventions
+
+### Separation of concerns — three mandatory folders
+
+Every concern is split across exactly three locations:
+
+```
+app/schemas/          — all Pydantic models for request/response/internal contracts
+app/agents/prompts/   — all LLM system prompts and human message templates
+app/routes/           — all FastAPI route definitions, minimal code only
+```
+
+No schema lives inside a feature folder. No prompt lives inside a route or service file. No heavy logic lives inside a routes file.
+
+### Routes are minimal
+
+Route files contain only the endpoint function and its dependency declarations. All logic is imported from the relevant module. The pattern is:
+
+```python
+# routes/websocket.py — correct
+from app.websocket.handler import handle_websocket_connection
+
+@router.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: UUID) -> None:
+    await handle_websocket_connection(websocket, user_id)
+```
+
+If a route function exceeds roughly 10 lines, the logic belongs elsewhere.
+
+### Prompts are constants
+
+Prompt files in `app/agents/prompts/` export named string constants and nothing else. No logic, no imports, no LLM calls. One file per concern, named by the concern it serves.
+
+```
+app/agents/prompts/
+  classification.py     — CLASSIFICATION_SYSTEM_PROMPT, CLASSIFICATION_HUMAN_TEMPLATE
+  normalisation.py      — NORMALISATION_SYSTEM_PROMPT, NORMALISATION_HUMAN_TEMPLATE
+  compression.py        — COMPRESSION_SYSTEM_PROMPT, COMPRESSION_HUMAN_TEMPLATE
+  job.py                — job engine system prompt
+  prep.py               — prep engine system prompt
+  document.py           — document engine system prompt
+  tracker.py            — tracker engine system prompt
+```
+
+### Schemas are contracts
+
+Schema files in `app/schemas/` export Pydantic models and type aliases only. One file per domain.
+
+```
+app/schemas/
+  websocket.py          — InboundMessage, OutboundToken, OutboundStatus, OutboundThinking,
+                          OutboundDone, OutboundError, OutboundMessage, EngineType
+  classification.py     — ClassificationResult, ExtendedEngineType
+  profile.py            — ProfileUploadResponse, ProfileStatusResponse
+  jobs.py               — JobSchema, JobStatusUpdate
+  documents.py          — DocumentSchema
+  prep.py               — RoadmapSchema, TopicMasterySchema
+  tracker.py            — TrackerSummarySchema
+```
+
+### File naming
+
+All files use `snake_case`. No abbreviations except well-established ones (`llm`, `jti`, `db`). Names describe what the file does, not what framework it uses:
+
+```
+handler.py        not websocket_handler.py
+classifier.py     not llm_classifier.py
+embeddings.py     not jina_embeddings.py
+indexer.py        not qdrant_indexer.py
+```
+
+### Engine structure
+
+Each engine follows the same internal layout:
+
+```
+agents/
+  job/
+    graph.py        — LangGraph graph definition, node wiring
+    nodes.py        — individual graph node functions
+    tools.py        — engine-specific @tool definitions
+    runner.py       — async run() entry point called by dispatch
+    state.py        — TypedDict state definition for this engine
+```
+
+Engine-specific schemas go in `app/schemas/`. Engine-specific prompts go in `app/agents/prompts/`. Nothing engine-specific leaks into the shared infrastructure.
+
+### Builder functions
+
+Infrastructure modules expose a `build_*` factory function that is called once in lifespan and returns a typed instance stored on `app.state`. The module never holds a module-level instance itself.
+
+```python
+# correct
+def build_llm_client() -> LLMClient: ...
+app.state.llm_client = build_llm_client()
+
+# never do this
+llm_client = build_llm_client()   # module-level global
+```
+
+---
+
 ## WebSocket Layer
 
 ### Connection lifecycle
@@ -16,76 +157,54 @@ ws://host/ws/{user_id}?token=<access_token>
 
 The handler sequence on connection:
 
-1. Extract `token` from query params
-2. Validate JWT: signature, expiry, `jti`, session not revoked
-3. If invalid: `websocket.close(code=1008)` without accepting
-4. If valid: `websocket.accept()`
-5. Register connection in the local `ConnectionManager`
-6. Subscribe to the user's Redis pub/sub channel: `stream:{user_id}`
-7. Start two concurrent async tasks: one listening for client messages, one listening for Redis messages
-8. On disconnect: unsubscribe from Redis, remove from `ConnectionManager`
+1. Extract token from query params
+2. Validate JWT: signature, expiry, jti, session not revoked — all before `accept()`
+3. If invalid: `websocket.close(code=1008)` without accepting, return
+4. Confirm path `user_id` matches token `user_id`
+5. `websocket.accept()`
+6. Register connection in `ConnectionManager`
+7. Set presence key in Redis
+8. Start three concurrent async tasks: `_listen_client`, `_listen_pubsub`, `_heartbeat`
+9. `asyncio.wait(FIRST_COMPLETED)` — when any task exits, cancel the others
+10. Finally block: disconnect from manager, clear presence
+
+### Three concurrent tasks
+
+`_listen_client` — sits in a loop on `receive_json()`. On each message, validates it as `InboundMessage` and fires `dispatch()` as `asyncio.create_task`. Returns immediately to `receive_json()` without waiting for the engine to finish. Exits on `WebSocketDisconnect`.
+
+`_listen_pubsub` — subscribes to Redis channel `stream:{user_id}`. Forwards every message published to that channel directly to the WebSocket client. This is the only path by which engine tokens reach the client — the engine publishes to Redis, this task delivers. Exits when the connection closes or Redis errors.
+
+`_heartbeat` — sends a WebSocket ping frame every 30 seconds. If the send does not complete within 10 seconds, the connection is declared dead, closed with code `1001`, and the task exits triggering full cleanup. The browser handles pong responses automatically at the protocol level — no client-side code needed.
+
+### Why `asyncio.create_task` in `_listen_client`
+
+If `dispatch()` were awaited directly, the client listener would block for the entire engine run — potentially 10–30 seconds. During that time the client could not send another message. `create_task` hands dispatch off to the event loop and the listener returns to `receive_json()` immediately, staying fully responsive throughout.
 
 ### ConnectionManager
 
-Holds in-process WebSocket references keyed by `user_id`. Handles sending messages to a specific connection on this worker. Does not know about connections on other workers — that is Redis's job.
-
-```python
-class ConnectionManager:
-    def __init__(self):
-        self.active: dict[str, WebSocket] = {}
-
-    async def connect(self, user_id: str, ws: WebSocket):
-        self.active[user_id] = ws
-
-    def disconnect(self, user_id: str):
-        self.active.pop(user_id, None)
-
-    async def send(self, user_id: str, message: dict):
-        ws = self.active.get(user_id)
-        if ws:
-            await ws.send_json(message)
-```
-
-Singleton instance initialised in the FastAPI lifespan context manager. Injected via `Depends()`.
+Holds in-process WebSocket references keyed by `user_id`. Handles delivery to connections on this worker only. Cross-worker delivery is Redis's responsibility.
 
 ### Redis pub/sub for multi-worker streaming
 
-When a LangGraph graph streams a token, the streaming loop publishes the token to a Redis channel. The WebSocket handler subscribed to that channel relays it to the connected client. This means token streaming works correctly regardless of which Uvicorn worker is running the graph and which worker holds the WebSocket connection.
+Token streaming works correctly regardless of which Uvicorn worker runs the LangGraph graph and which holds the WebSocket connection. The engine publishes to `stream:{user_id}` on Redis `db=1`. The `_listen_pubsub` task on the WebSocket worker picks up and delivers.
 
-Channel naming: `stream:{user_id}`
+Publisher and subscriber use separate Redis connections — a connection in subscribe mode cannot issue regular commands.
 
-Every streamed event goes through this channel. The WebSocket handler's Redis subscriber task receives it and calls `ConnectionManager.send()`.
+### Heartbeat configuration
 
-This uses **Redis db=1** (WebSocket and pub/sub), completely isolated from auth token storage on db=0.
-
-```python
-class RedisPubSubManager:
-    def __init__(self, redis_url: str):
-        self.redis_url = redis_url
-        self._publisher: aioredis.Redis = None
-        self._subscriber: aioredis.Redis = None
-
-    async def startup(self):
-        self._publisher = await aioredis.from_url(self.redis_url, db=1)
-        self._subscriber = await aioredis.from_url(self.redis_url, db=1)
-
-    async def publish(self, user_id: str, message: dict):
-        await self._publisher.publish(
-            f"stream:{user_id}",
-            json.dumps(message)
-        )
-
-    async def subscribe(self, user_id: str):
-        pubsub = self._subscriber.pubsub()
-        await pubsub.subscribe(f"stream:{user_id}")
-        return pubsub
 ```
+_HEARTBEAT_INTERVAL_SECONDS = 30
+_HEARTBEAT_TIMEOUT_SECONDS  = 10
+```
+
+Worst case: a dead connection is detected and cleaned up within 40 seconds.
 
 ### WebSocket message protocol
 
 All messages are JSON. No raw text.
 
-Client to server:
+**Client to server:**
+
 ```json
 {
   "type": "message",
@@ -95,28 +214,61 @@ Client to server:
 }
 ```
 
-`chat_id` is null when starting a new conversation. `engine_type` is null when starting a new conversation (classification will determine it). Both are populated on follow-up turns.
+`chat_id` is null on a new conversation. `engine_type` is null on a new conversation — classification determines it. Both are populated on all follow-up turns.
 
-Server to client:
+**Server to client:**
+
 ```json
-{ "type": "token", "content": "..." }
-{ "type": "status", "content": "Searching jobs..." }
+{ "type": "token",    "content": "..." }
+{ "type": "status",   "content": "Searching jobs..." }
 { "type": "thinking", "content": "Checking your profile..." }
-{ "type": "done", "chat_id": "uuid", "engine_type": "job", "title": "ML roles in Nairobi" }
-{ "type": "error", "content": "Something went wrong, please try again." }
+{ "type": "done",     "chat_id": "uuid", "engine_type": "job", "title": "ML roles in Nairobi" }
+{ "type": "error",    "content": "Something went wrong, please try again." }
 ```
 
-The `done` event carries the `chat_id` (newly created or existing) and the auto-generated title on the first turn of a new chat. The client stores these for subsequent turns.
+The `done` event carries `chat_id` and the auto-generated title on the first turn. The client stores these for subsequent turns.
+
+### File layout
+
+```
+app/
+  websocket/
+    handler.py      — _authenticate, _listen_client, _listen_pubsub,
+                      _heartbeat, handle_websocket_connection
+    manager.py      — ConnectionManager
+    pubsub.py       — RedisPubSubManager
+    dispatch.py     — _resolve_engine, _ensure_chat_session, _route_to_engine, dispatch
+
+  routes/
+    websocket.py    — @router.websocket("/ws/{user_id}"), calls handle_websocket_connection
+
+  schemas/
+    websocket.py    — InboundMessage, OutboundToken, OutboundStatus, OutboundThinking,
+                      OutboundDone, OutboundError, OutboundMessage, EngineType
+```
 
 ---
 
 ## Classification Layer
 
-Every new chat message where `engine_type` is null passes through classification before routing.
+### New conversation only
+
+The classifier runs once — on the first message of a new conversation where `chat_id` is null. This is the only time engine type is unknown.
+
+For continuing conversations (`chat_id` is present), the declared `engine_type` is trusted and passed straight through to the engine. No validator, no second LLM call. The engine's own LLM has the full conversation checkpoint and handles drift naturally in its response — it tells the user to start a new chat if the message is clearly off-topic. This eliminates an unnecessary round trip on every continuing message.
+
+```python
+async def _resolve_engine(message, app) -> EngineType | None:
+    if message.chat_id is not None:
+        return message.engine_type   # continuing — trust and pass through
+
+    result = await classify_message(message.content, small_llm)
+    return None if result.engine_type == "unsupported" else result.engine_type
+```
 
 ### Classifier
 
-Uses Claude Haiku 4.5 for speed and cost. Single call, structured output via `llm.with_structured_output()` using a Pydantic schema.
+Uses Claude Haiku 4.5. Single call, JSON output parsed into `ClassificationResult`.
 
 ```python
 class ClassificationResult(BaseModel):
@@ -125,27 +277,38 @@ class ClassificationResult(BaseModel):
     reasoning: str
 ```
 
-The prompt instructs Haiku to classify the user's message into one of five categories based on intent:
+Categories:
 
-- `job`: finding roles, searching, job recommendations
-- `prep`: interview preparation, roadmaps, practice, quizzing
-- `document`: resume, cover letter, writing, editing documents
-- `tracker`: tracking applications, follow-ups, pipeline analysis, funnel discussion
-- `unsupported`: anything outside these four domains
+- **job** — finding roles, searching, job recommendations
+- **prep** — interview preparation, roadmaps, practice, quizzing
+- **document** — resume, cover letter, writing, editing documents
+- **tracker** — tracking applications, follow-ups, pipeline analysis
+- **unsupported** — anything outside these four domains
 
-The `reasoning` field is used for logging and debugging, not shown to the user.
-
-### Validation on continuing conversations
-
-When `engine_type` is provided by the client (continuing conversation), the classifier runs a lightweight validation check. If the message content is strongly inconsistent with the declared engine type, the validator overrides it and treats it as a cross-engine request. This guards against client-side manipulation and handles natural conversation drift.
-
-Cross-engine requests are handled gracefully: the agent in the current engine acknowledges the new intent and offers to open a new chat with relevant context carried over.
+`reasoning` is used for logging and debugging only, never shown to the user.
 
 ### Unsupported query handling
 
-Unsupported queries never return a cold rejection. The response is warm and redirecting:
+```
+"That is outside what I am set up to help with. I can help you search for jobs,
+prepare for interviews, write your resume or cover letter, or analyse your
+application pipeline. Which of those would be useful right now?"
+```
 
-"That is outside what I am set up to help with. I can help you search for jobs, prepare for interviews, write your resume or cover letter, or analyse your application pipeline. Which of those would be useful right now?"
+### File layout
+
+```
+app/
+  classification/
+    classifier.py   — classify_message(), imports prompt from agents/prompts/
+
+  agents/
+    prompts/
+      classification.py   — CLASSIFICATION_SYSTEM_PROMPT, CLASSIFICATION_HUMAN_TEMPLATE
+
+  schemas/
+    classification.py     — ClassificationResult, ExtendedEngineType, EngineType
+```
 
 ---
 
@@ -153,17 +316,19 @@ Unsupported queries never return a cold rejection. The response is warm and redi
 
 ### Short-term memory: AsyncPostgresSaver
 
-Every engine's graph is compiled with `AsyncPostgresSaver` as the checkpointer. This persists the full graph state to PostgreSQL after every node execution.
+Every engine's graph is compiled with `AsyncPostgresSaver` as the checkpointer. It is entered as an async context manager in the FastAPI lifespan so LangGraph manages its own connection pool independently of SQLAlchemy.
 
 ```python
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-async with AsyncPostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
-    await checkpointer.setup()
-    graph = engine_graph.compile(checkpointer=checkpointer)
+checkpointer = AsyncPostgresSaver.from_conn_string(DATABASE_URL)
+async with checkpointer as cp:
+    await cp.setup()
+    app.state.checkpointer = cp
+    yield
 ```
 
-The `thread_id` used in the config is always `{user_id}:{chat_id}`. This scopes state to the user and the specific conversation, ensuring complete isolation.
+The `thread_id` is always `{user_id}:{chat_id}`, scoping state to the user and conversation.
 
 ```python
 config = {"configurable": {"thread_id": f"{user_id}:{chat_id}"}}
@@ -171,55 +336,50 @@ async for mode, chunk in graph.astream(state, config, stream_mode=["custom", "me
     ...
 ```
 
-When a user resumes a chat, the graph is invoked with the same `thread_id`. LangGraph automatically loads the latest checkpoint and resumes from where the conversation left off. No manual history management is needed.
+When a user resumes a chat, the same `thread_id` is used and LangGraph loads the latest checkpoint automatically. No manual history management.
 
 ### Long-term memory: AsyncPostgresStore
 
-Facts that should persist across separate chat sessions — target companies, preferred role types, stated skill gaps, communication style preferences — are stored in the LangGraph Store.
+Facts that persist across separate chat sessions — target companies, preferred role types, stated skill gaps, communication preferences — are stored in the LangGraph Store.
 
 ```python
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
 store = AsyncPostgresStore.from_conn_string(DATABASE_URL)
 await store.setup()
+app.state.store = store
 ```
 
 Namespace: `("memories", user_id)`
 
-Each memory is a JSON document. The agent reads relevant memories at the start of every new conversation using semantic search over the store. The agent writes to the store when the user reveals something worth persisting — target company, timeline, stated weakness, preference.
-
-This is what makes the agent feel like it knows the user across sessions without the user having to repeat themselves.
+The agent reads relevant memories at the start of every new conversation and writes to the store when the user reveals something worth persisting. This is what makes the agent feel like it knows the user across sessions.
 
 ### Chat session index table
 
-LangGraph's internal checkpoint tables are not designed for UI queries. The `chat_sessions` table is maintained separately for the sidebar and chat history UI:
+LangGraph checkpoint tables are not designed for UI queries. The `chat_sessions` table is maintained separately for the sidebar. Both are keyed by the same `chat_id`.
 
-```
-chat_sessions
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid()
-  user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE
-  engine_type       TEXT NOT NULL
-  title             TEXT
-  is_archived       BOOLEAN NOT NULL DEFAULT false
-  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-```
-
-This table is written to when a new chat is created. The `title` is populated after the first message using a Haiku summarisation call on the first user message. Both `chat_sessions` and the LangGraph checkpointer are keyed by the same `chat_id`, tying them together.
+The title is populated after the first agent response using a Haiku summarisation call on the first user message.
 
 ### Conversation compression
 
-Long conversations are compressed to prevent the context window from being exhausted and to control token costs.
+Before each graph invocation, if `state["messages"]` exceeds the engine's token threshold:
 
-Before each graph invocation, a pre-processing step counts the total token length of `state["messages"]`. If it exceeds 8,000 tokens:
-
-1. All messages except the last 4 turns are extracted
-2. A Haiku summarisation call converts them into a concise briefing
+1. All messages except the last N turns are extracted
+2. A Haiku summarisation call produces a concise briefing
 3. The briefing replaces the old messages as a single `SystemMessage`
-4. The last 4 turns remain verbatim
+4. The tail turns remain verbatim
 5. The updated message list is written back to the checkpoint
 
-The briefing format:
+**Engine-specific thresholds — all environment-configurable:**
+
+| Engine   | Token threshold | Verbatim tail | Notes |
+|----------|-----------------|---------------|-------|
+| prep     | 12,000          | 6 turns       | Fast accumulation. Briefing must carry a serialised `topic_mastery` snapshot to prevent re-quizzing covered material. |
+| job      | 8,000           | 4 turns       | Episodic searches. Default settings appropriate. |
+| document | 8,000           | 4 turns       | Short iterative conversations. Compression rarely triggers. |
+| tracker  | 8,000           | 4 turns       | Read-heavy, short exchanges. Default settings appropriate. |
+
+Compression briefing format:
 
 ```
 [Session summary]
@@ -231,8 +391,6 @@ User prefers concise technical explanations.
 User has confirmed strong knowledge of gradient descent and backpropagation.
 ```
 
-This gives the model full context in a fraction of the tokens. The last 4 verbatim turns ensure the model has precise recent context for the current exchange.
-
 ---
 
 ## Profile Ingestion Pipeline
@@ -242,79 +400,56 @@ This gives the model full context in a fraction of the tokens. The last 4 verbat
 User uploads a PDF or DOCX file. The backend:
 
 1. Reads the file bytes
-2. Routes to the correct extractor based on file type:
-   - PDF: `pypdf2` — reads all pages, concatenates text
+2. Detects file type from filename and content-type header
+3. Routes to the correct extractor:
+   - PDF: `pypdf` — reads all pages, concatenates text
    - DOCX: `python-docx` — reads paragraphs and tables
-3. Raw extracted text is stored in `user_profiles.raw_text`
+4. Stores raw extracted text in `user_profiles.raw_text`
 
 ### Normalisation
 
-The raw text is passed to the large LLM with a structured normalisation prompt (preferred: Claude Sonnet 4.6). The prompt instructs the model to convert whatever format it receives into the canonical Prepwise profile markdown schema:
+The raw text is passed to the large LLM (Claude Sonnet 4.6) with the normalisation system prompt from `app/agents/prompts/normalisation.py`. Output is the canonical Prepwise profile markdown stored in `user_profiles.normalised_md`.
 
-```markdown
-# Name
+The system prompt is passed with `cache_control: ephemeral` for prompt caching.
 
-## Identity
-name, location, contact, target roles
+### Chunking
 
-## Skills
-### Skill Name
-Depth: 1-5
-context and projects
+The chunker (`vector/chunks.py`) parses the normalised markdown into typed `ProfileChunk` objects. Chunking strategy is structured block chunking — not sliding window — because the normalised profile is already pre-structured into discrete semantic units. Each block is independently meaningful; overlapping chunks would produce vectors spanning two unrelated concepts and degrade retrieval accuracy.
 
-## Projects
-### Project Name
-Stack: tool1, tool2
-Metrics: scale numbers, impact
-description
+One chunk per block:
+- Each `### Skill` block
+- Each `### Project` block
+- Each `### Role` block in Experience
+- The `## Identity` block
+- The `## Achievements` block
+- The `## Certifications` block
 
-## Experience
-### Role Title
-Company: name
-Period: dates
-Stack: tool1, tool2
-contributions and outcomes
+Sliding window chunking (`RecursiveCharacterTextSplitter`) is used for job descriptions in the job engine, where the source is unstructured prose.
 
-## Achievements
-awards, recognition
+### Embedding and indexing
 
-## Certifications
-name, issuer, year
+Chunks are embedded via the custom `JinaEmbeddings` wrapper (`vector/embeddings.py`) and upserted to the shared `profile_chunks` Qdrant collection with `user_id` as a payload field. Re-upload deletes all existing vectors for the user before re-indexing. `user_profiles.indexed_at` is updated via ORM after successful indexing.
+
+### File layout
+
 ```
+app/
+  profile/
+    extractor.py    — extract_text(), detect_file_type()
+    normaliser.py   — normalise_profile(), imports prompt from agents/prompts/
+    indexer.py      — index_profile(), _delete_user_vectors(), _embed_chunks(),
+                      _upsert_points(), _mark_indexed() via ORM
 
-The normalised markdown is stored in `user_profiles.normalised_md`.
+  vector/
+    chunks.py       — ProfileChunk dataclass, parse_profile_chunks()
+    embeddings.py   — JinaEmbeddings, build_embeddings()
+    qdrant_client.py — build_qdrant_client(), setup_collections(),
+                       get_qdrant_client()
 
-### Chunking and embedding
-
-The chunker (`vector/chunks.py`) parses the normalised markdown:
-
-- Each `### Skill` block becomes one chunk
-- Each `### Project` block becomes one chunk
-- Each `### Role` block becomes one chunk
-- The `## Identity` block becomes one chunk
-
-Each chunk carries metadata:
-
-```python
-{
-    "user_id": "uuid",
-    "type": "skill | project | experience | identity",
-    "name": "block name",
-    "stack_tags": ["python", "fastapi"],      # extracted from Stack: line
-    "depth_level": 4,                          # extracted from Depth: line
-    "period": "2023-2025"                      # extracted from Period: line
-}
+  agents/
+    prompts/
+      normalisation.py  — NORMALISATION_SYSTEM_PROMPT, NORMALISATION_HUMAN_TEMPLATE
 ```
-
-Chunks are embedded via Jina Embeddings v4 API using `task_type=retrieval.passage`. Stored in Qdrant collection `profile_chunks_{user_id}` — one collection per user, ensuring complete data isolation.
-
-### Re-indexing
-
-Re-upload triggers:
-1. Delete all vectors for this user from Qdrant
-2. Run extraction and normalisation again
-3. Re-chunk and re-embed
-4. Update `user_profiles.indexed_at`
 
 ---
 
@@ -322,29 +457,80 @@ Re-upload triggers:
 
 ### Qdrant collections
 
-Two logical collections per user:
+Two shared collections serve all users. Isolation is enforced by filtering on `user_id` metadata on every query without exception, enforced unconditionally at the repository layer.
 
-`profile_chunks_{user_id}` — profile data
-`prep_chunks_{user_id}` — generated subtopics and questions from prep sessions
+| Collection      | Purpose |
+|-----------------|---------|
+| `profile_chunks` | Profile data — skills, projects, experience, identity blocks |
+| `prep_chunks`    | Generated subtopics and questions from prep sessions |
 
-Vector dimension: 1024 (Jina Embeddings v4)
+Per-user collections do not scale — Qdrant is optimised for a small number of large collections. One collection per user introduces memory fragmentation, slower cluster rebalancing, and collection management overhead that compounds as user count grows.
 
-Jina task types:
-- `retrieval.passage` — when embedding content being stored
-- `retrieval.query` — when embedding a search query
+**Vector dimension:** 2048 (Jina Embeddings v4 single-vector mode, truncatable to 128 via MRL)
+**Distance metric:** Cosine
+**Payload index:** `user_id` field indexed as `KEYWORD` on both collections for fast filtered queries.
 
-Using the correct task type materially improves retrieval accuracy. This must be enforced in the embeddings module.
+### Payload schema — profile_chunks
+
+```json
+{
+  "user_id": "uuid",
+  "type": "skill | project | experience | identity | achievement | certification",
+  "name": "block name",
+  "stack_tags": ["python", "fastapi"],
+  "depth_level": 4,
+  "period": "2023-2025",
+  "text": "full chunk text"
+}
+```
+
+### Payload schema — prep_chunks
+
+```json
+{
+  "user_id": "uuid",
+  "roadmap_id": "uuid",
+  "subject": "ML Fundamentals",
+  "topic": "Bias-Variance Tradeoff",
+  "subtopic": "in practice",
+  "skill_tags": ["machine learning", "statistics"],
+  "mastery_level": "strong",
+  "session_date": "2025-07-09"
+}
+```
+
+### Custom JinaEmbeddings wrapper
+
+The `langchain-community` `JinaEmbeddings` class does not pass the `task` parameter to the Jina API for v3+ models. Both `embed_documents` and `embed_query` make identical API calls, silently disabling the task-specific LoRA adapters and degrading retrieval accuracy.
+
+The custom `JinaEmbeddings` class in `vector/embeddings.py` fixes this:
+
+```
+embed_documents()  →  task: retrieval.passage
+embed_query()      →  task: retrieval.query
+```
+
+It inherits from LangChain's `Embeddings` base class. Switching providers requires changing only the class import and the `EMBEDDING_MODEL` env var — no call sites change.
+
+```python
+# current
+from app.vector.embeddings import JinaEmbeddings
+embeddings = JinaEmbeddings(model=settings.embedding_model)
+
+# switching to Google — only these two lines change
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+embeddings = GoogleGenerativeAIEmbeddings(model=settings.embedding_model)
+```
 
 ### Retrieval pattern
 
-Every engine that needs profile context calls `get_profile_context(query)`. This function:
+`get_profile_context(query)` in the shared tools layer:
 
-1. Embeds the query with `task_type=retrieval.query`
-2. Searches `profile_chunks_{user_id}` with a top-k of 5
-3. Filters by `user_id` metadata to enforce isolation
-4. Returns the top 5 chunks as formatted text
+1. Embeds the query with `task: retrieval.query`
+2. Searches `profile_chunks` filtered by `user_id`, top-k of 5
+3. Returns the top 5 chunks as formatted text
 
-The agent never receives the full profile. It receives only what is semantically relevant to the current query. This keeps token usage low and keeps the model focused.
+The agent never receives the full profile — only what is semantically relevant to the current query.
 
 ---
 
@@ -352,129 +538,108 @@ The agent never receives the full profile. It receives only what is semantically
 
 ### Provider agnosticism via LangChain
 
-All LLM calls go through LangChain's `ChatAnthropic` interface (or the equivalent provider class). LangChain abstracts the provider behind a common interface — `invoke`, `stream`, `bind_tools`, `with_structured_output` — so switching the underlying model or provider requires changing an environment variable and the model class import, not rewriting any agent logic, graph nodes, or tool definitions.
-
-The preferred provider is Anthropic. The preferred models are Claude Sonnet 4.6 for generation and Claude Haiku 4.5 for classification. These are defaults, not hard dependencies. If requirements change — cost, capability, latency, compliance — the model can be swapped at the configuration layer.
+All LLM calls go through LangChain's provider interface. Switching provider requires changing the import and the model string in `llm/client.py` — no agent logic, graph nodes, or tool definitions change.
 
 ```python
 from langchain_anthropic import ChatAnthropic
-# swap to any other provider by changing this import and the model string
-# from langchain_openai import ChatOpenAI
-# from langchain_google_genai import ChatGoogleGenerativeAI
-
-llm_large = ChatAnthropic(model=LLM_LARGE_MODEL)    # preferred: claude-sonnet-4-6
-llm_small = ChatAnthropic(model=LLM_SMALL_MODEL)    # preferred: claude-haiku-4-5-20251001
+llm_large = ChatAnthropic(model=settings.llm_large_model)
+llm_small = ChatAnthropic(model=settings.llm_small_model)
 ```
 
-Environment variables use generic names — `LLM_LARGE_MODEL` and `LLM_SMALL_MODEL` — not provider-specific names, reinforcing that the model string is a configuration concern, not an architectural one.
+### Task routing
 
-### Large model (default: Claude Sonnet 4.6)
+`llm/router.py` exposes `LLMTask` (a `StrEnum`) and `get_llm(client, task)` which returns the large or small model based on task type.
 
-Used for all generation tasks that require reasoning, writing quality, or nuanced understanding:
+**Large model tasks** — require reasoning, writing quality, nuanced understanding:
+profile normalisation, resume/cover letter generation, roadmap generation, JD analysis, conversational agent responses.
 
-- Profile normalisation
-- Resume and cover letter generation
-- Roadmap generation
-- Job description analysis
-- Conversational responses in prep and document engines
-
-### Small model (default: Claude Haiku 4.5)
-
-Used for all classification, extraction, and scoring tasks where speed and cost matter more than generation quality:
-
-- Engine classification
-- Cross-engine validation
-- Job result scoring
-- Conversation compression and summarisation
-- Auto-generating chat titles
-- ATS keyword extraction
+**Small model tasks** — classification, extraction, scoring, summarisation:
+engine classification, job result scoring, conversation compression, chat title generation, ATS keyword extraction.
 
 ### Prompt caching
 
-Where the active provider supports prompt caching (Anthropic does natively), the system prompt for each engine and the profile context are passed with `cache_control: ephemeral`. This reduces input token costs significantly on repeated calls within the cache TTL window. If the provider is switched to one that does not support prompt caching, this gracefully degrades — the calls still work, just without the cache discount.
+System prompts and profile context are passed with `cache_control: ephemeral` on providers that support it (Anthropic natively). A keepalive task in `llm/cache.py` pings registered prompts every 4 minutes to hold the cache TTL open. Engines register their system prompt via `register_system_prompt()` at startup.
 
-A keepalive task pings the cached prompts every 4 minutes to maintain the cache TTL.
+### File layout
+
+```
+app/
+  llm/
+    client.py     — LLMClient dataclass, build_llm_client()
+    router.py     — LLMTask StrEnum, get_llm(), get_llm_client()
+    cache.py      — run_cache_keepalive(), register_system_prompt()
+```
 
 ---
 
 ## Tool Architecture
 
-All tools use the `@tool` decorator from `langchain_core.tools`. Bound to the LLM via `llm.bind_tools(tools)`. LangGraph's built-in `ToolNode` handles execution and automatically feeds results back into `state["messages"]` as `ToolMessage` objects.
+All tools use the `@tool` decorator from `langchain_core.tools`. Bound to the LLM via `llm.bind_tools(tools)`. LangGraph's built-in `ToolNode` handles execution and feeds results back into `state["messages"]` as `ToolMessage` objects automatically.
 
-### Shared tools (available to all engines)
+### Shared tools
 
-```python
-@tool
-def get_profile_context(query: str) -> str:
-    """Retrieve relevant sections of the user's professional profile
-    based on the query. Use this when you need to know the user's
-    skills, experience, or background."""
-    ...
-
-@tool
-def get_recent_job_searches(limit: int = 5) -> list:
-    """Retrieve the user's most recently saved or searched jobs.
-    Use this to find context about what roles the user is targeting."""
-    ...
-
-@tool
-def get_long_term_memories() -> str:
-    """Retrieve facts remembered about this user from previous sessions,
-    such as target companies, preferences, and stated goals."""
-    ...
+```
+app/agents/shared/tools/
+  profile_tool.py       — get_profile_context
+  job_history_tool.py   — get_recent_job_searches
+  memory_tool.py        — get_long_term_memories
 ```
 
 ### Engine-specific tools
 
-Defined in each engine's own `tools/` module. Detailed in each engine's document.
+Defined in each engine's `tools.py`. Detailed in each engine's document.
 
 ---
 
 ## Redis Database Allocation
 
-Redis supports 16 logical databases (db=0 through db=15) on a single instance. Each concern gets its own dedicated database — zero key collision, clean isolation, independent flush without affecting other concerns.
-
 ```
 db=0    auth sessions         access:{jti}, refresh:{token_hash}
 db=1    websocket / pubsub    stream:{user_id}, presence:{user_id}
-db=2    chat session cache    session:cache:{user_id}:{chat_id}, classification results
+db=2    chat session cache    session:cache:{user_id}:{chat_id}
 db=3    rate limiting         slowapi counters for login and API throttling
 ```
 
-Each database gets its own connection pool initialised at startup. Services receive the pool relevant to their concern via `Depends()` — the auth service never touches db=1, the pub/sub manager never touches db=0.
+Each database has its own connection pool initialised at startup. Services receive only the pool relevant to their concern via `Depends()`.
 
 ---
 
 ## Singleton Initialisation
 
-All infrastructure clients are initialised once in the FastAPI lifespan context manager and stored on `app.state`. They are never instantiated per request.
-
 ```python
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db_pool = await create_async_engine(DATABASE_URL)
+    redis_pools = build_redis_pools()
+    app.state.redis_auth      = redis_pools["auth"]
+    app.state.redis_pubsub    = RedisPubSubManager()
+    await app.state.redis_pubsub.startup()
+    app.state.redis_cache     = redis_pools["cache"]
+    app.state.redis_ratelimit = redis_pools["ratelimit"]
 
-    # four isolated Redis connection pools, one per logical database
-    app.state.redis_auth = await aioredis.from_url(REDIS_URL, db=0)
-    app.state.redis_pubsub = RedisPubSubManager(REDIS_URL)
-    await app.state.redis_pubsub.startup()              # connects on db=1
-    app.state.redis_cache = await aioredis.from_url(REDIS_URL, db=2)
-    app.state.redis_ratelimit = await aioredis.from_url(REDIS_URL, db=3)
+    app.state.llm_client  = build_llm_client()
+    app.state.embeddings  = build_embeddings()
 
-    app.state.qdrant = QdrantClient(QDRANT_HOST, QDRANT_PORT)
-    app.state.llm_large = ChatAnthropic(model=LLM_LARGE_MODEL)   # preferred: claude-sonnet-4-6
-    app.state.llm_small = ChatAnthropic(model=LLM_SMALL_MODEL)   # preferred: claude-haiku-4-5-20251001
-    app.state.checkpointer = AsyncPostgresSaver.from_conn_string(DATABASE_URL)
-    await app.state.checkpointer.setup()
-    app.state.store = AsyncPostgresStore.from_conn_string(DATABASE_URL)
-    await app.state.store.setup()
-    app.state.connection_manager = ConnectionManager()
-    yield
+    qdrant = build_qdrant_client()
+    await setup_collections(qdrant)
+    app.state.qdrant_client = qdrant
+
+    async with AsyncPostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+        await checkpointer.setup()
+        app.state.checkpointer = checkpointer
+
+        app.state.store = AsyncPostgresStore.from_conn_string(DATABASE_URL)
+        await app.state.store.setup()
+
+        app.state.connection_manager = ConnectionManager()
+
+        asyncio.create_task(run_cache_keepalive(app.state.llm_client.large))
+
+        await _check_dependencies(app)
+        yield
+
     await app.state.redis_pubsub.shutdown()
-    await app.state.redis_auth.aclose()
-    await app.state.redis_cache.aclose()
-    await app.state.redis_ratelimit.aclose()
-    await app.state.db_pool.dispose()
+    await close_redis_pools(redis_pools)
+    await app.state.qdrant_client.close()
 ```
 
 ---
@@ -484,21 +649,15 @@ async def lifespan(app: FastAPI):
 ```
 backend/
   app/
-    core/
-      config.py               environment variable loading
-      security.py             JWT encode/decode, bcrypt
-      dependencies.py         FastAPI Depends() providers
-      compression.py          conversation compression logic
-    websocket/
-      manager.py              ConnectionManager
-      pubsub.py               RedisPubSubManager
-      router.py               ws endpoint, auth handshake, message dispatch
-      schemas.py              WebSocket message Pydantic models
-    classification/
-      classifier.py           Haiku classification call
-      validator.py            cross-engine validation
-      schemas.py              ClassificationResult model
     agents/
+      prompts/
+        classification.py     CLASSIFICATION_SYSTEM_PROMPT, CLASSIFICATION_HUMAN_TEMPLATE
+        normalisation.py      NORMALISATION_SYSTEM_PROMPT, NORMALISATION_HUMAN_TEMPLATE
+        compression.py        COMPRESSION_SYSTEM_PROMPT
+        job.py                JOB_SYSTEM_PROMPT
+        prep.py               PREP_SYSTEM_PROMPT
+        document.py           DOCUMENT_SYSTEM_PROMPT
+        tracker.py            TRACKER_SYSTEM_PROMPT
       shared/
         tools/
           profile_tool.py
@@ -508,23 +667,38 @@ backend/
           store.py            AsyncPostgresStore read/write helpers
           compression.py      message compression logic
       job/
+        graph.py
+        nodes.py
+        tools.py
+        runner.py
+        state.py
       prep/
+        graph.py
+        nodes.py
+        tools.py
+        runner.py
+        state.py
       document/
+        graph.py
+        nodes.py
+        tools.py
+        runner.py
+        state.py
       tracker/
-    vector/
-      qdrant_client.py        singleton Qdrant client
-      embeddings.py           Jina embedding calls with correct task types
-      chunks.py               profile markdown parser and chunker
-    llm/
-      client.py               ChatAnthropic singleton wrappers
-      router.py               model selection logic
-      cache.py                prompt cache keepalive
-    profile/
-      extractor.py            pypdf2 and python-docx extraction
-      normaliser.py           Sonnet normalisation call
-      indexer.py              chunking, embedding, Qdrant upsert
+        graph.py
+        nodes.py
+        tools.py
+        runner.py
+        state.py
+    classification/
+      classifier.py
+    core/
+      config.py
+      security.py
+      dependencies.py
     db/
-      session.py              async SQLAlchemy engine and session factory
+      session.py
+      redis.py
       models/
         base.py
         users.py
@@ -534,12 +708,37 @@ backend/
         documents.py
         prep.py
         profile.py
+    llm/
+      client.py
+      router.py
+      cache.py
+    profile/
+      extractor.py
+      normaliser.py
+      indexer.py
     routes/
       auth.py
+      websocket.py
       profile.py
       tracker_panel.py
-    services/
-    repositories/
+    schemas/
+      websocket.py
+      classification.py
+      profile.py
+      jobs.py
+      documents.py
+      prep.py
+      tracker.py
+    vector/
+      qdrant_client.py
+      embeddings.py
+      chunks.py
+    websocket/
+      handler.py
+      manager.py
+      pubsub.py
+      dispatch.py
+    main.py
 ```
 
 ---
@@ -547,25 +746,38 @@ backend/
 ## Environment Variables
 
 ```
-DATABASE_URL                  postgresql+asyncpg://user:pass@host:5432/db
-REDIS_URL                     redis://localhost:6379
-REDIS_DB_AUTH                 0
-REDIS_DB_PUBSUB               1
-REDIS_DB_CACHE                2
-REDIS_DB_RATELIMIT            3
-QDRANT_HOST                   localhost
-QDRANT_PORT                   6333
+DATABASE_URL                        postgresql+asyncpg://user:pass@host:5432/db
+REDIS_URL                           redis://localhost:6379
+REDIS_PASSWORD
+REDIS_DB_AUTH                       0
+REDIS_DB_PUBSUB                     1
+REDIS_DB_CACHE                      2
+REDIS_DB_RATELIMIT                  3
+QDRANT_HOST                         localhost
+QDRANT_PORT                         6333
 ANTHROPIC_API_KEY
-LLM_LARGE_MODEL               claude-sonnet-4-6          # preferred large model
-LLM_SMALL_MODEL               claude-haiku-4-5-20251001  # preferred small model
+LLM_LARGE_MODEL                     claude-sonnet-4-6
+LLM_SMALL_MODEL                     claude-haiku-4-5-20251001
 JINA_API_KEY
+EMBEDDING_MODEL                     jina-embeddings-v4
+EMBEDDING_DIMENSIONS                2048
 SERP_API_KEY
 JWT_ACCESS_SECRET
 JWT_REFRESH_SECRET
-JWT_ACCESS_EXPIRY_MINUTES     15
-JWT_REFRESH_EXPIRY_DAYS       30
-BCRYPT_COST                   12
-APP_ENV                       development | production
+JWT_ACCESS_EXPIRY_MINUTES           15
+JWT_REFRESH_EXPIRY_DAYS             30
+BCRYPT_COST                         12
+APP_ENV                             development | production
 APP_HOST
 APP_PORT
+
+# Compression thresholds — tunable per engine without code changes
+COMPRESSION_THRESHOLD_PREP          12000
+COMPRESSION_THRESHOLD_JOB           8000
+COMPRESSION_THRESHOLD_DOCUMENT      8000
+COMPRESSION_THRESHOLD_TRACKER       8000
+COMPRESSION_TAIL_TURNS_PREP         6
+COMPRESSION_TAIL_TURNS_JOB          4
+COMPRESSION_TAIL_TURNS_DOCUMENT     4
+COMPRESSION_TAIL_TURNS_TRACKER      4
 ```

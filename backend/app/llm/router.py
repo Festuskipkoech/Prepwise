@@ -1,42 +1,40 @@
 from enum import StrEnum
 
-from app.core.config import settings
+from langchain_anthropic import ChatAnthropic
+from fastapi import Request
+
+from app.llm.client import LLMClient
 
 class LLMTask(StrEnum):
-    ROADMAP_GENERATION = "roadmap_generation"
-    SUBTOPIC_GENERATION = "subtopic_generation"
-    QUESTION_GENERATION = "question_generation"
-    RESUME_GENERATION = "resume_generation"
-    COVER_LETTER_GENERATION = "cover_letter_generation"
-    JD_ANALYSIS = "jd_analysis"
-    PREP_PATH_GENERATION = "prep_path_generation"
-    JOB_SUBJECT_GENERATION = "job_subject_generation"
-    JOB_SCORING = "job_scoring"
-    TRACKER_SUMMARY = "tracker_summary"
-    CLASSIFICATION = "classification"
+    # Large model tasks — require reasoning, writing quality, nuanced understanding
+    PROFILE_NORMALISE = "profile_normalise"
+    RESUME_GENERATE = "resume_generate"
+    COVER_LETTER_GENERATE = "cover_letter_generate"
+    ROADMAP_GENERATE = "roadmap_generate"
+    JD_ANALYSE = "jd_analyse"
+    AGENT_RESPONSE = "agent_response"
 
+    # Small model tasks — classification, extraction, scoring, summarisation
+    ENGINE_CLASSIFY = "engine_classify"
+    ENGINE_VALIDATE = "engine_validate"
+    JOB_SCORE = "job_score"
+    CONVERSATION_COMPRESS = "conversation_compress"
+    CHAT_TITLE = "chat_title"
+    ATS_EXTRACT = "ats_extract"
 
-SONNET_TASKS = {
-    LLMTask.ROADMAP_GENERATION,
-    LLMTask.SUBTOPIC_GENERATION,
-    LLMTask.QUESTION_GENERATION,
-    LLMTask.RESUME_GENERATION,
-    LLMTask.COVER_LETTER_GENERATION,
-    LLMTask.JD_ANALYSIS,
-    LLMTask.PREP_PATH_GENERATION,
-    LLMTask.JOB_SUBJECT_GENERATION,
+_SMALL_TASKS = {
+    LLMTask.ENGINE_CLASSIFY,
+    LLMTask.ENGINE_VALIDATE,
+    LLMTask.JOB_SCORE,
+    LLMTask.CONVERSATION_COMPRESS,
+    LLMTask.CHAT_TITLE,
+    LLMTask.ATS_EXTRACT,
 }
 
-HAIKU_TASKS = {
-    LLMTask.JOB_SCORING,
-    LLMTask.TRACKER_SUMMARY,
-    LLMTask.CLASSIFICATION,
-}
+def get_llm(client: LLMClient, task: LLMTask) -> ChatAnthropic:
+    if task in _SMALL_TASKS:
+        return client.small
+    return client.large
 
-
-def resolve_model(task: LLMTask) -> str:
-    if task in SONNET_TASKS:
-        return settings.llm_large_model
-    if task in HAIKU_TASKS:
-        return settings.llm_small_model
-    return settings.llm_large_model
+def get_llm_client(request: Request) -> LLMClient:
+    return request.app.state.llm_client

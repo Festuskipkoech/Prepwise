@@ -1,55 +1,49 @@
 import asyncio
-from typing import Any
+import logging
  
-from anthropic import AsyncAnthropic
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+ 
+logger = logging.getLogger(__name__)
+ 
+_KEEPALIVE_INTERVAL_SECONDS = 240
+_KEEPALIVE_PROMPT = "keepalive"
 
-from app.core.config import settings
+# System prompts eligible for prompt caching.
+# Each engine registers its system prompt here at startup so the keepalive
+# task can ping them all and hold the cache TTL open.
 
-def build_cached_system_message(profile_text: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "text",
-            "text": profile_text,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
+_registered_system_prompts: list[str] = []
 
-def build_cached_messages(
-    profile_text: str,
-    user_message: str,
-) -> dict[str, Any]:
-    return {
-        "system": build_cached_system_message(profile_text),
-        "messages": [
-            {"role": "user", "content": user_message}
-        ],
-    }
+def register_system_prompt(prompt: str) -> None:
+    _registered_system_prompts.append(prompt)
 
-class CacheKeepalive:
-    def __init__(self, profile_text: str, interval_seconds: int = 240) -> None:
-        self.profile_text = profile_text
-        self.interval_seconds = interval_seconds
-        self._task: asyncio.Task | None = None
-        self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+async def _ping_prompt(llm: ChatAnthropic, system_prompt: str) -> None:
 
-    async def _ping(self) -> None:
-        await self._client.messages.create(
-            model = settings.llm_small_model,
-            max_tokens=1,
-            system=build_cached_system_message(self.profile_text),
-            messages=[{"role": "user", "content": "ping"}]
-        )
-    async def _loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.interval_seconds)
-            try:
-                await self._ping()
-            except Exception:
-                pass
-    def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop())
-    def stop(self) -> None:
-        if self._task and not self._task.done():
-            self._task.cancel()
-    
+    try:
+        messages = [
+            SystemMessage(
+                content = [
+                    {
+                        "type": "text",
+                        "text":system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            ),
+            HumanMessage(content=_KEEPALIVE_PROMPT),
+        ]
+        await llm.ainvoke(messages)
+        logger.debug("Prompt cache keepalive ping sent.")
+    except Exception:
+        logger.warning("Prompt cache keepalive ping failed.", exc_info=True)
+
+async  def run_cache_keepalive(llm: ChatAnthropic) -> None:
+    logger.info("Prompt cache keepalive task started.")
+
+    while True:
+        await asyncio.sleep(_KEEPALIVE_INTERVAL_SECONDS)
+        if not _registered_system_prompts:
+            continue
+        for prompt in _registered_system_prompts:
+            await _ping_prompt(llm, prompt)
