@@ -29,7 +29,8 @@ async def classify_message(content: str, llm: ChatAnthropic) -> ClassificationRe
     raw = response.content.strip()
 
     try:
-        result = ClassificationResult.model_validate_json(raw)
+        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        result = ClassificationResult.model_validate_json(cleaned)
     except Exception:
         logger.warning(
             "Classification response could not be parsed — defaulting to unsupported. Raw: %r",

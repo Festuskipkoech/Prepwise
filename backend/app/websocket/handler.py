@@ -2,6 +2,7 @@ import asyncio
 import logging
 from uuid import UUID
 
+from anyio import ClosedResourceError
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
 
@@ -91,11 +92,11 @@ async def _listen_client(
                     app=websocket.app,
                 )
             )
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, ClosedResourceError):
         logger.debug("Client disconnected — user %s", user_id)
     except Exception:
         logger.exception("Unexpected error in client listener — user %s", user_id)
-
+        
 async def _listen_pubsub(
     websocket: WebSocket,
     user_id: UUID,

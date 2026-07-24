@@ -93,6 +93,7 @@ async def test_ensure_chat_session_returns_existing_chat_id(auth):
 
 @pytest.mark.asyncio
 async def test_dispatch_publishes_error_for_unsupported_message(app, auth):
+    from app.main import app as fastapi_app
     from app.websocket.dispatch import dispatch
 
     user_id = await _get_user_id(auth)
@@ -117,7 +118,7 @@ async def test_dispatch_publishes_error_for_unsupported_message(app, auth):
             user_id=user_id,
             message=message,
             pubsub_manager=MockPubSub(),
-            app=app,
+            app=fastapi_app,
         )
 
     assert len(published_messages) == 1

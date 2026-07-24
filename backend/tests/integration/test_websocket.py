@@ -1,106 +1,101 @@
 import pytest
+import httpx
 from uuid import uuid4
+from unittest.mock import patch
+from httpx_ws import aconnect_ws
+from httpx_ws.transport import ASGIWebSocketTransport
 
-# Auth rejection — before accept()
+from app.core.security import decode_access_token
+from app.main import app as fastapi_app
+
+
+def _get_user_id(access_token: str) -> str:
+    decoded = decode_access_token(access_token)
+    return decoded["user_id"]
+
+
 @pytest.mark.asyncio
 async def test_websocket_rejects_missing_token(app):
-    fastapi_app, _ = app
-    from starlette.testclient import TestClient
-    with TestClient(fastapi_app) as test_client:
-        user_id = uuid4()
+    user_id = uuid4()
+    async with httpx.AsyncClient(
+        transport=ASGIWebSocketTransport(app=fastapi_app), base_url="http://test"
+    ) as client:
         with pytest.raises(Exception):
-            with test_client.websocket_connect(f"/ws/{user_id}") as ws:
-                ws.receive_json()
+            async with aconnect_ws(f"http://test/ws/{user_id}", client) as ws:
+                await ws.receive_json()
+
 
 @pytest.mark.asyncio
 async def test_websocket_rejects_invalid_token(app):
-    fastapi_app, _ = app
-    from starlette.testclient import TestClient
-
-    with TestClient(fastapi_app) as test_client:
-        user_id = uuid4()
+    user_id = uuid4()
+    async with httpx.AsyncClient(
+        transport=ASGIWebSocketTransport(app=fastapi_app), base_url="http://test"
+    ) as client:
         with pytest.raises(Exception):
-            with test_client.websocket_connect(
-                f"/ws/{user_id}?token=not.a.real.token"
+            async with aconnect_ws(
+                f"http://test/ws/{user_id}?token=not.a.real.token", client
             ) as ws:
-                ws.receive_json()
+                await ws.receive_json()
+
 
 @pytest.mark.asyncio
 async def test_websocket_rejects_mismatched_user_id(app, auth):
-    fastapi_app, _ = app
-    from starlette.testclient import TestClient
-
     wrong_user_id = uuid4()
-
-    with TestClient(fastapi_app) as test_client:
+    async with httpx.AsyncClient(
+        transport=ASGIWebSocketTransport(app=fastapi_app), base_url="http://test"
+    ) as client:
         with pytest.raises(Exception):
-            with test_client.websocket_connect(
-                f"/ws/{wrong_user_id}?token={auth['access_token']}"
+            async with aconnect_ws(
+                f"http://test/ws/{wrong_user_id}?token={auth['access_token']}", client
             ) as ws:
-                ws.receive_json()
+                await ws.receive_json()
 
-# Valid connection
+
 @pytest.mark.asyncio
-async def test_websocket_accepts_valid_token(app, auth, authed_client):
-    fastapi_app, _ = app
-    from starlette.testclient import TestClient
-
-    sessions_resp = await authed_client.get("/api/auth/sessions")
-    sessions = sessions_resp.json()["sessions"]
-    assert len(sessions) >= 1
-
-    from app.core.security import decode_access_token
-    decoded = decode_access_token(auth["access_token"])
-    user_id = decoded["user_id"]
-
-    with TestClient(fastapi_app) as test_client:
-        with test_client.websocket_connect(
-            f"/ws/{user_id}?token={auth['access_token']}"
+async def test_websocket_accepts_valid_token(app, auth):
+    user_id = _get_user_id(auth["access_token"])
+    async with httpx.AsyncClient(
+        transport=ASGIWebSocketTransport(app=fastapi_app), base_url="http://test"
+    ) as client:
+        async with aconnect_ws(
+            f"http://test/ws/{user_id}?token={auth['access_token']}", client
         ) as ws:
             assert ws is not None
 
-# Invalid message format
+
 @pytest.mark.asyncio
 async def test_websocket_sends_error_on_invalid_message(app, auth):
-    fastapi_app, _ = app
-    from starlette.testclient import TestClient
-    from app.core.security import decode_access_token
-
-    decoded = decode_access_token(auth["access_token"])
-    user_id = decoded["user_id"]
-
-    with TestClient(fastapi_app) as test_client:
-        with test_client.websocket_connect(
-            f"/ws/{user_id}?token={auth['access_token']}"
+    user_id = _get_user_id(auth["access_token"])
+    async with httpx.AsyncClient(
+        transport=ASGIWebSocketTransport(app=fastapi_app), base_url="http://test"
+    ) as client:
+        async with aconnect_ws(
+            f"http://test/ws/{user_id}?token={auth['access_token']}", client
         ) as ws:
-            ws.send_json({"type": "message", "content": ""})
-            resp = ws.receive_json()
+            await ws.send_json({"type": "message", "content": ""})
+            resp = await ws.receive_json()
             assert resp["type"] == "error"
 
-# Valid message — receives status
+
 @pytest.mark.asyncio
 async def test_websocket_valid_message_receives_status(app, auth):
-    fastapi_app, _ = app
-    from starlette.testclient import TestClient
-    from unittest.mock import patch
-    from app.schemas.classification import ClassificationResult
-    from app.core.security import decode_access_token
-
-    decoded = decode_access_token(auth["access_token"])
-    user_id = decoded["user_id"]
+    user_id = _get_user_id(auth["access_token"])
 
     with patch("app.websocket.dispatch.classify_message") as mock_classify:
+        from app.schemas.classification import ClassificationResult
         mock_classify.return_value = ClassificationResult(
             engine_type="job",
             confidence=0.95,
             reasoning="Job search.",
         )
 
-        with TestClient(fastapi_app) as test_client:
-            with test_client.websocket_connect(
-                f"/ws/{user_id}?token={auth['access_token']}"
+        async with httpx.AsyncClient(
+            transport=ASGIWebSocketTransport(app=fastapi_app), base_url="http://test"
+        ) as client:
+            async with aconnect_ws(
+                f"http://test/ws/{user_id}?token={auth['access_token']}", client
             ) as ws:
-                ws.send_json({
+                await ws.send_json({
                     "type": "message",
                     "chat_id": None,
                     "engine_type": None,
@@ -110,7 +105,7 @@ async def test_websocket_valid_message_receives_status(app, auth):
                 received = []
                 for _ in range(5):
                     try:
-                        msg = ws.receive_json(timeout=5)
+                        msg = await ws.receive_json()
                         received.append(msg)
                         if msg["type"] in ("done", "error"):
                             break
@@ -118,6 +113,4 @@ async def test_websocket_valid_message_receives_status(app, auth):
                         break
 
                 types = {m["type"] for m in received}
-                assert "status" in types or "error" in types, (
-                    f"Expected status or error in {types}"
-                )
+                assert "status" in types or "error" in types

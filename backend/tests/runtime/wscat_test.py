@@ -18,12 +18,15 @@ What it does:
     5. Prints every message received for up to 30 seconds
     6. Cleanly disconnects and prints a summary
 """
+
 import asyncio
 import json
 import os
 import sys
 import httpx
 import websockets
+from dotenv import load_dotenv
+load_dotenv()
 
 from app.core.security import decode_access_token
 
@@ -31,6 +34,7 @@ APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
 WS_BASE_URL = os.environ.get("WS_BASE_URL", "ws://localhost:8000")
 LISTEN_TIMEOUT_SECONDS = 30
 TEST_MESSAGE = "Find me ML engineering roles in Nairobi"
+
 
 def _separator(label: str) -> None:
     print(f"\n{'=' * 60}")
@@ -60,6 +64,7 @@ async def _login() -> tuple[str, str]:
     access_token = resp.json()["access_token"]
     print(f"Login OK — token length: {len(access_token)}")
     return access_token, email
+
 
 async def _connect_and_listen(access_token: str) -> None:
     decoded = decode_access_token(access_token)
@@ -125,6 +130,7 @@ async def _connect_and_listen(access_token: str) -> None:
     has_content = "token" in received_types or "status" in received_types
     print(f"Smoke test result      : {'PASS' if has_content else 'FAIL — no content received'}")
 
+
 async def main() -> None:
     for var in ("TEST_USER_EMAIL", "TEST_USER_PASSWORD"):
         if not os.environ.get(var):
@@ -133,6 +139,7 @@ async def main() -> None:
 
     access_token, _ = await _login()
     await _connect_and_listen(access_token)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
